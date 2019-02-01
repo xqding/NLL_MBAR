@@ -2,6 +2,17 @@ import numpy as np
 import torch
 
 def calc_energy(z, parameters):
+    """
+    calculate energy U and gradient of U with respect to z
+
+    Args:
+        z: tensor of size batch_size x d, where d is the dimension of z
+    """
+    
+    z = z.clone().detach().requires_grad_(True)        
+    pi = z.new_tensor(np.pi, requires_grad = False)
+    d = z.shape[-1]
+
     mu_0 = parameters['mu_0']
     sigma_0 = parameters['sigma_0']
     mu_1 = parameters['mu_1']
@@ -9,35 +20,26 @@ def calc_energy(z, parameters):
     mu_r = parameters['mu_r']
     sigma_r = parameters['sigma_r']
     beta = parameters['beta']    
-
-    z = z.clone().detach().requires_grad_(True)        
-    pi = z.new_tensor(np.pi, requires_grad = False)
-
-    d = z.shape[0]
     
-    energy_target = - torch.log(
-        0.5*1.0/((2*pi)**(d/2.0)*torch.sqrt(torch.abs(torch.det(sigma_0)))) * \
-        torch.exp(
-            -0.5*torch.matmul(torch.matmul(torch.inverse(sigma_0), z - mu_0), z - mu_0)
-        ) + \
-        0.5*1.0/((2*pi)**(d/2.0)*torch.sqrt(torch.abs(torch.det(sigma_1)))) * \
-        torch.exp(
-            -0.5*torch.matmul(torch.matmul(torch.inverse(sigma_1), z - mu_1), z - mu_1)
-        )
-        )
+    sigma_0_product = torch.exp(torch.sum(torch.log(sigma_0)))
+    sigma_1_product = torch.exp(torch.sum(torch.log(sigma_1)))    
     
-    energy_ref = 0.5*torch.matmul(torch.matmul(torch.inverse(sigma_r), z - mu_r), z - mu_r)+\
-                 d/2.0*torch.log(2*pi) + 0.5*torch.log(torch.abs(torch.det(sigma_r)))
+    energy_target = -torch.log(
+        0.5*1.0/((2*pi)**(d/2.0)*sigma_0_product) * \
+        torch.exp(torch.sum(-0.5*((z - mu_0)/sigma_0)**2, -1)) + \
+        0.5*1.0/((2*pi)**(d/2.0)*sigma_1_product) * \
+        torch.exp(torch.sum(-0.5*((z - mu_1)/sigma_1)**2, -1))
+    )
 
+    energy_ref = 0.5*d*torch.log(2*pi) + torch.sum(torch.log(sigma_r)) + \
+                 torch.sum(0.5*((z - mu_r)/sigma_r)**2, -1)
+    
+    energy = beta*energy_target + (1-beta)*energy_ref
+    energy.backward(torch.ones_like(energy))
 
-    energy = beta * energy_target + (1.0 - beta)*energy_ref    
-
-    energy.backward()
-
-    return energy, z.grad, energy_target.data, energy_ref.data
-
+    return energy.data, z.grad, energy_target.data, energy_ref.data
+    
 def HMC(calc_energy, epsilon, L, current_q, parameters):
-    beta = parameters['beta']
     ## sample a new momentum
     current_p = torch.randn_like(current_q)
 
@@ -45,6 +47,8 @@ def HMC(calc_energy, epsilon, L, current_q, parameters):
     q = current_q.clone().detach()
     p = current_p.clone().detach()        
 
+    epsilon = epsilon.reshape(-1, 1)
+    
     ## propagate momentum by a half step at the beginning
     U, grad_U, _, _ = calc_energy(q, parameters)
     p = p - 0.5*epsilon*grad_U
@@ -71,48 +75,33 @@ def HMC(calc_energy, epsilon, L, current_q, parameters):
 
     ## accept proposed state using Metropolis criterion
     flag = torch.rand_like(proposed_E) <= torch.exp(-(proposed_E - current_E))
-    #flag = flag.float().reshape(-1,1)
+    flag = flag.double().reshape(-1,1)
     
     q = flag*q + (1 - flag)*current_q
 
+    flag = parameters['beta'] == 0
+    dim_z = q.shape[-1]
+    q[flag] = parameters['mu_r'] + parameters['sigma_r']*torch.randn(torch.sum(flag).item(), dim_z)
     return flag, q
 
-def TRE_HMC(L, epsilon, beta, num_steps, burn_in_num_steps, parameters):
+def TRE_HMC(L, epsilon, num_steps, burn_in_num_steps, parameters):
+    beta = parameters['beta']
     num_beta = len(beta)
     assert(len(beta) == len(epsilon))
-
+    dim_z = parameters['mu_0'].shape[0]
+    
     samples = []
     energy = []
-
-    mu_r = parameters['mu_r']
-    sigma_r = parameters['sigma_r']
     
-    ## initialize conformations
-    for i in range(len(beta)):
-        samples.append([])
-        energy.append([])
-        q = torch.randn()
-        samples[i].append(q)
+    z = parameters['mu_r'] + parameters['sigma_r']*torch.randn(num_beta, dim_z)
+    samples.append(z)
 
-    for k in range(num_steps):
+    for k in range(num_steps):        
         print("Steps: {}".format(k))
-        for i in range(len(beta)):
-            if beta[i] == 0:
-                q = torch.randn((batch_size, 10),
-                                dtype = x.dtype,
-                                device = x.device)
-                samples[i].append(q)
-                _, _, energy_pz, energy_pxgz = vae.calc_energy(x, q, 1.0)
-                energy[i].append(energy_pxgz.data)
-
-            else:
-                flag, q = vae.HMC(x, epsilon[i], L, samples[i][-1], beta[i])
-                samples[i].append(q)
-                _, _, energy_pz, energy_pxgz = vae.calc_energy(x, q, 1.0)
-                energy[i].append(energy_pxgz.data)
-
-                # print("beta: {:.2f}, epsilon: {:.2f}, acceptance ratio: {:.3f}".format(
-                #     beta[i],epsilon[i], torch.mean(flag).item()))
+        flag, z = HMC(calc_energy, epsilon, L, samples[-1], parameters)
+        samples.append(z)
+        _, _, energy_target, energy_ref = calc_energy(z, parameters)        
+        energy.append((energy_target, energy_ref))
 
         ## exchange
         step_range = 5
@@ -120,23 +109,66 @@ def TRE_HMC(L, epsilon, beta, num_steps, burn_in_num_steps, parameters):
             for j in range(i+1, i+step_range):
                 if j == i:
                     continue
-                # print((i,j))            
-                accept_p = torch.exp((energy[j][-1] - energy[i][-1])*(beta[j] - beta[i]))
+                accept_p = torch.exp(
+                    (energy_target[j] - energy_target[i] +
+                     energy_ref[i] - energy_ref[j]) *
+                    (beta[j] - beta[i])
+                )
+                
                 flag = torch.rand_like(accept_p) <= accept_p
 
-                tmp = samples[j][-1].clone().detach()
-                samples[j][-1][flag] = samples[i][-1][flag]
-                samples[i][-1][flag] = tmp[flag]
-            
-    for i in range(len(beta)):
-        energy[i] = torch.stack(energy[i][burn_in_num_steps:], dim = -1)
+                tmp = samples[-1].clone().detach()
+                samples[-1][flag] = samples[-1][flag]
+                samples[-1][flag] = tmp[flag]
 
-    energy = torch.cat(energy, dim = -1)
-    num_conformations = energy.shape[-1]
-    energy = energy.view([batch_size, 1, num_conformations])
-    beta = energy.new_tensor(beta)
-    beta = beta.view([1,num_beta, 1])
+    energy_target = [e_target for e_target, e_ref in energy[burn_in_num_steps:]]
+    energy_ref = [e_ref for e_target, e_ref in energy[burn_in_num_steps:]]
 
-    energy = energy * beta
+    energy_target = torch.cat(energy_target)
+    energy_ref = torch.cat(energy_ref)
 
+    energy = torch.matmul(beta.reshape(-1,1), energy_target.reshape(1,-1)) + \
+             torch.matmul(1-beta.reshape(-1,1), energy_ref.reshape(1,-1))
+        
     return energy
+
+
+
+
+
+
+
+# def calc_energy(z, parameters):
+#     mu_0 = parameters['mu_0']
+#     sigma_0 = parameters['sigma_0']
+#     mu_1 = parameters['mu_1']
+#     sigma_1 = parameters['sigma_1']
+#     mu_r = parameters['mu_r']
+#     sigma_r = parameters['sigma_r']
+#     beta = parameters['beta']    
+
+#     z = z.clone().detach().requires_grad_(True)        
+#     pi = z.new_tensor(np.pi, requires_grad = False)
+
+#     d = z.shape[0]
+    
+#     energy_target = - torch.log(
+#         0.5*1.0/((2*pi)**(d/2.0)*torch.sqrt(torch.abs(torch.det(sigma_0)))) * \
+#         torch.exp(
+#             -0.5*torch.matmul(torch.matmul(torch.inverse(sigma_0), z - mu_0), z - mu_0)
+#         ) + \
+#         0.5*1.0/((2*pi)**(d/2.0)*torch.sqrt(torch.abs(torch.det(sigma_1)))) * \
+#         torch.exp(
+#             -0.5*torch.matmul(torch.matmul(torch.inverse(sigma_1), z - mu_1), z - mu_1)
+#         )
+#         )
+    
+#     energy_ref = 0.5*torch.matmul(torch.matmul(torch.inverse(sigma_r), z - mu_r), z - mu_r)+\
+#                  d/2.0*torch.log(2*pi) + 0.5*torch.log(torch.abs(torch.det(sigma_r)))
+
+
+#     energy = beta * energy_target + (1.0 - beta)*energy_ref    
+
+#     energy.backward()
+
+#     return energy, z.grad, energy_target.data, energy_ref.data
